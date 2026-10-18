@@ -652,9 +652,12 @@ app.post('/api/worker/tasks/:id/submit',requireRole('worker'),(req,res)=>{
 });
 app.get('/api/worker/earnings',requireRole('worker'),(req,res)=>{
  const wid=taskWorker(req),records=adminEarnings.filter(e=>resolveWorkerId(e.workerId)===wid);
- const total=records.reduce((a,e)=>a+Number(e.amount||0),0),paid=records.filter(e=>e.paidAt).reduce((a,e)=>a+Number(e.amount||0),0);
- const pending=adminTasks.filter(t=>t.status==='submitted'&&resolveWorkerId(t.assignedWorkerId)===wid).reduce((a,t)=>a+Number(t.estimatedAmount||0),0);
- res.json({ok:true,total,paid,unpaid:total-paid,pending,history:records});
+ const now=Date.now(),hold=48*60*60*1000;
+ const amount=e=>Number(e.amount)||0;
+ const total=records.reduce((a,e)=>a+amount(e),0),paid=records.filter(e=>e.paidAt).reduce((a,e)=>a+amount(e),0);
+ const pending=records.filter(e=>!e.paidAt&&now<new Date(e.availableAt||new Date(e.createdAt).getTime()+hold).getTime()).reduce((a,e)=>a+amount(e),0);
+ const availableForWithdrawal=records.filter(e=>!e.paidAt&&now>=new Date(e.availableAt||new Date(e.createdAt).getTime()+hold).getTime()).reduce((a,e)=>a+amount(e),0);
+ res.json({ok:true,total,paid,unpaid:total-paid,pending,availableForWithdrawal,history:records.map(e=>({...e,availableAt:e.availableAt||new Date(new Date(e.createdAt).getTime()+hold).toISOString()}))});
 });
 // Update only the public display name. Login username, worker ID, and records never change.
 app.post('/api/admin/workers/:id/display-name', requireRole('admin'), (req, res) => {
@@ -693,7 +696,7 @@ app.post('/api/admin/tasks/:id/review',requireRole('admin'),(req,res)=>{
  else if(action==='approve'){
   const amount=Number(req.body?.amount);if(!Number.isFinite(amount)||amount<0)return res.status(400).json({error:'Valid payment amount required'});
   if(adminEarnings.some(e=>e.taskId===t.id))return res.status(409).json({error:'Task already credited'});
-  const record={id:crypto.randomUUID(),taskId:t.id,workerId:t.assignedWorkerId,type:'completed_task',title:t.title,amount,createdAt:new Date().toISOString(),paidAt:null};
+  const record={id:crypto.randomUUID(),taskId:t.id,workerId:t.assignedWorkerId,type:'completed_task',title:t.title,amount,createdAt:new Date().toISOString(),availableAt:new Date(Date.now()+48*60*60*1000).toISOString(),paidAt:null};
   adminEarnings.unshift(record);persistEarnings();t.status='completed';t.approvedAt=record.createdAt;t.approvedAmount=amount;
  }else return res.status(400).json({error:'Invalid action'});
  saveTasks();io.emit('earnings-updated');notifyTask(t,t.status);res.json({ok:true,task:t});
