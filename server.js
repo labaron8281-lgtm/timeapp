@@ -404,6 +404,36 @@ app.get('/health', (_req, res) => {
   });
 });
 
+const appLoginAttempts = new Map();
+function appLoginRateLimit(req, res, next) {
+  const key = req.ip || 'unknown';
+  const now = Date.now();
+  let entry = appLoginAttempts.get(key);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + 10 * 60 * 1000 };
+    appLoginAttempts.set(key, entry);
+  }
+  if (entry.count >= 10) {
+    return res.status(429).json({ ok: false, error: 'Too many attempts. Try again in 10 minutes.' });
+  }
+  entry.count += 1;
+  next();
+}
+
+// Shared-password gate for the Apartments.com desktop app. Password exists only in Render env.
+app.post('/api/app-login', appLoginRateLimit, (req, res) => {
+  const configuredPassword = process.env.APP_LOGIN_PASSWORD;
+  if (typeof configuredPassword !== 'string' || configuredPassword.length < 12) {
+    return res.status(503).json({ ok: false, error: 'App login is not configured on the server.' });
+  }
+  const suppliedPassword = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (!secureEqual(suppliedPassword, configuredPassword)) {
+    return res.status(401).json({ ok: false, error: 'Incorrect password.' });
+  }
+  appLoginAttempts.delete(req.ip || 'unknown');
+  return res.json({ ok: true });
+});
+
 app.post('/api/login', loginRateLimit, (req, res) => {
   const username = String(req.body.username || '').trim();
   const password = String(req.body.password || '');
