@@ -622,73 +622,40 @@ function persistEarnings() {
 }
 
 function persistChat() {
-  writeJsonAtomic(CHAT_FILE, chatMessages.slice(-2000));
+  writeJsonAtomic(CHAT_FILE, chatMessages);
 }
 
-app.get('/api/worker/tasks', requireRole('worker'), (req,res) => {
-  const wid = resolveWorkerId(req.session.user.username || req.session.user.id);
-  const userSessions = workSessions.filter(s => resolveWorkerId(s.workerId) === wid);
-  const totalMs = userSessions.reduce((sum, s) => sum + (Number(s.durationMs) || 0), 0);
-  const totalHours = (totalMs / 3600000);
-  const workDays = new Set(userSessions.map(s => new Date(s.startedAt).toDateString())).size;
-
-  const myTasks = adminTasks.filter(t => {
-    const target = resolveWorkerId(t.workerId);
-    const assigned = resolveWorkerId(t.assignedWorkerId);
-    if (!target && !assigned) return true; // Open for all
-    return target === wid || assigned === wid;
-  });
-
-  const completedTasks = myTasks.filter(t => ['submitted', 'completed'].includes(t.status)).length;
-
-  const myManualEarnings = adminEarnings.filter(e => resolveWorkerId(e.workerId) === wid);
-  const bonusAmount = myManualEarnings.reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
-  const manualHours = myManualEarnings.reduce((sum, e) => sum + (Number(e.hours) || 0), 0);
-
-  const grandTotalHours = (totalHours + manualHours).toFixed(1);
-
-  res.json({
-    ok: true,
-    tasks: myTasks,
-    manualEarnings: myManualEarnings,
-    stats: {
-      totalMs,
-      totalHours: grandTotalHours,
-      workDays,
-      completedTasks,
-      bonusAmount: bonusAmount.toFixed(2)
-    }
-  });
+function saveTasks(){writeJsonAtomic(TASKS_FILE,adminTasks);io.emit('tasks-updated');}
+function taskWorker(req){return resolveWorkerId(req.session.user.username||req.session.user.id);}
+function notifyTask(task,type){io.to('admins').emit('task-notification',{type,taskId:task.id,workerId:task.assignedWorkerId||task.workerId});if(task.assignedWorkerId||task.workerId)io.to('worker:'+(task.assignedWorkerId||task.workerId)).emit('task-notification',{type,taskId:task.id});}
+app.get('/api/worker/tasks',requireRole('worker'),(req,res)=>{
+ const wid=taskWorker(req),tasks=adminTasks.filter(t=>(t.status==='open'&&!t.workerId&&!t.assignedWorkerId)||resolveWorkerId(t.assignedWorkerId)===wid||(t.status==='pending_acceptance'&&resolveWorkerId(t.workerId)===wid));
+ const manualEarnings=adminEarnings.filter(e=>resolveWorkerId(e.workerId)===wid);
+ res.json({ok:true,tasks,manualEarnings,stats:{completedTasks:tasks.filter(t=>t.status==='completed').length,bonusAmount:manualEarnings.reduce((a,e)=>a+Number(e.amount||0),0).toFixed(2)}});
 });
-
-app.post('/api/worker/tasks/:id/submit', requireRole('worker'), (req,res) => {
-  const wid = resolveWorkerId(req.session.user.username || req.session.user.id);
-  const task = adminTasks.find(t => t.id === req.params.id && (!resolveWorkerId(t.workerId) || resolveWorkerId(t.workerId) === wid || resolveWorkerId(t.assignedWorkerId) === wid));
-  if (!task) return res.status(404).json({error: 'Task not found'});
-  if (task.status === 'completed') return res.status(409).json({error: 'Task already completed'});
-
-  task.assignedWorkerId = wid;
-  task.status = 'submitted';
-  task.submittedAt = new Date().toISOString();
-  fs.writeFileSync(TASKS_FILE, JSON.stringify(adminTasks, null, 2));
-  io.emit('tasks-updated');
-  res.json({ok: true, task});
+app.post('/api/worker/tasks/:id/accept',requireRole('worker'),(req,res)=>{
+ const wid=taskWorker(req),t=adminTasks.find(t=>t.id===req.params.id);
+ if(!t)return res.status(404).json({error:'Task not found'});
+ if(!((t.status==='open'&&!t.workerId&&!t.assignedWorkerId)||(t.status==='pending_acceptance'&&resolveWorkerId(t.workerId)===wid)))return res.status(409).json({error:'Task already taken or unavailable'});
+ t.assignedWorkerId=wid;t.status='in_progress';t.acceptedAt=new Date().toISOString();saveTasks();notifyTask(t,'accepted');res.json({ok:true,task:t});
 });
-
-app.post('/api/worker/tasks/:id/accept', requireRole('worker'), (req,res) => {
-  const wid = resolveWorkerId(req.session.user.username || req.session.user.id);
-  const task = adminTasks.find(t => t.id === req.params.id && (!resolveWorkerId(t.workerId) || resolveWorkerId(t.workerId) === wid));
-  if (!task) return res.status(404).json({error: 'Task not found'});
-  if (task.status !== 'open') return res.status(409).json({error: 'Task unavailable'});
-
-  task.assignedWorkerId = wid;
-  task.status = 'in_progress';
-  task.acceptedAt = new Date().toISOString();
-  fs.writeFileSync(TASKS_FILE, JSON.stringify(adminTasks, null, 2));
-  io.emit('tasks-updated');
-  res.json({ok: true, task});
+app.post('/api/worker/tasks/:id/decline',requireRole('worker'),(req,res)=>{
+ const wid=taskWorker(req),t=adminTasks.find(t=>t.id===req.params.id);
+ if(!t||t.status!=='pending_acceptance'||resolveWorkerId(t.workerId)!==wid)return res.status(409).json({error:'Not a pending assignment'});
+ t.status='declined';t.declinedAt=new Date().toISOString();saveTasks();notifyTask(t,'declined');res.json({ok:true,task:t});
 });
-
+app.post('/api/worker/tasks/:id/submit',requireRole('worker'),(req,res)=>{
+ const wid=taskWorker(req),t=adminTasks.find(t=>t.id===req.params.id);
+ if(!t||resolveWorkerId(t.assignedWorkerId)!==wid)return res.status(403).json({error:'Not your task'});
+ if(!['in_progress','revision_requested'].includes(t.status))return res.status(409).json({error:'Task not ready for submission'});
+ t.submissionNotes=String(req.body?.notes||'').slice(0,4000);t.submittedAt=new Date().toISOString();t.status='submitted';saveTasks();notifyTask(t,'submitted');res.json({ok:true,task:t});
+});
+app.get('/api/worker/earnings',requireRole('worker'),(req,res)=>{
+ const wid=taskWorker(req),records=adminEarnings.filter(e=>resolveWorkerId(e.workerId)===wid);
+ const total=records.reduce((a,e)=>a+Number(e.amount||0),0),paid=records.filter(e=>e.paidAt).reduce((a,e)=>a+Number(e.amount||0),0);
+ const pending=adminTasks.filter(t=>t.status==='submitted'&&resolveWorkerId(t.assignedWorkerId)===wid).reduce((a,t)=>a+Number(t.estimatedAmount||0),0);
+ res.json({ok:true,total,paid,unpaid:total-paid,pending,history:records});
+});
 // Update only the public display name. Login username, worker ID, and records never change.
 app.post('/api/admin/workers/:id/display-name', requireRole('admin'), (req, res) => {
   const wid = resolveWorkerId(req.params.id);
@@ -710,37 +677,41 @@ app.post('/api/admin/workers/:id/display-name', requireRole('admin'), (req, res)
 
 app.get('/api/admin/tasks', requireRole('admin'), (_req,res) => res.json({ok: true, tasks: adminTasks}));
 
-app.post('/api/admin/tasks', requireRole('admin'), (req,res) => {
-  const title = String(req.body?.title || '').trim().slice(0, 160);
-  const description = String(req.body?.description || '').trim().slice(0, 2000);
-  const workerId = resolveWorkerId(req.body?.workerId);
-
-  if (!title) return res.status(400).json({error: 'Title required'});
-
-  const task = {
-    id: crypto.randomUUID(),
-    title,
-    description,
-    workerId,
-    status: 'open',
-    createdAt: new Date().toISOString()
-  };
-  adminTasks.unshift(task);
-  fs.writeFileSync(TASKS_FILE, JSON.stringify(adminTasks, null, 2));
-  io.emit('tasks-updated');
-  res.json({ok: true, task});
+app.post('/api/admin/tasks',requireRole('admin'),(req,res)=>{
+ const title=String(req.body?.title||'').trim().slice(0,160),description=String(req.body?.description||'').trim().slice(0,2000),workerId=resolveWorkerId(req.body?.workerId);
+ if(!title)return res.status(400).json({error:'Title required'});
+ if(workerId&&!users.some(u=>u.role==='worker'&&resolveWorkerId(u.id||u.username)===workerId))return res.status(400).json({error:'Unknown worker'});
+ const task={id:crypto.randomUUID(),title,description,workerId:workerId||'',assignedWorkerId:'',status:workerId?'pending_acceptance':'open',estimatedAmount:Number(req.body?.estimatedAmount)||0,createdAt:new Date().toISOString()};
+ adminTasks.unshift(task);saveTasks();notifyTask(task,'created');res.json({ok:true,task});
 });
-
-app.post('/api/admin/tasks/status', requireRole('admin'), (req,res) => {
-  const task = adminTasks.find(t => t.id === req.body?.id);
-  if (!task || !['open', 'completed'].includes(req.body?.status)) return res.status(400).json({error: 'Invalid task or status'});
-  task.status = req.body.status;
-  task.updatedAt = new Date().toISOString();
-  fs.writeFileSync(TASKS_FILE, JSON.stringify(adminTasks, null, 2));
-  io.emit('tasks-updated');
-  res.json({ok: true, task});
+app.post('/api/admin/tasks/status',requireRole('admin'),(req,res)=>res.status(410).json({error:'Use task review, reassign, or cancel actions'}));
+app.post('/api/admin/tasks/:id/review',requireRole('admin'),(req,res)=>{
+ const t=adminTasks.find(t=>t.id===req.params.id);if(!t)return res.status(404).json({error:'Task not found'});
+ if(t.status!=='submitted')return res.status(409).json({error:'Task must be submitted for review'});
+ const action=req.body?.action;
+ if(action==='revision'){const reason=String(req.body?.reason||'').trim();if(!reason)return res.status(400).json({error:'Revision reason required'});t.status='revision_requested';t.revisionReason=reason.slice(0,2000);}
+ else if(action==='approve'){
+  const amount=Number(req.body?.amount);if(!Number.isFinite(amount)||amount<0)return res.status(400).json({error:'Valid payment amount required'});
+  if(adminEarnings.some(e=>e.taskId===t.id))return res.status(409).json({error:'Task already credited'});
+  const record={id:crypto.randomUUID(),taskId:t.id,workerId:t.assignedWorkerId,type:'completed_task',title:t.title,amount,createdAt:new Date().toISOString(),paidAt:null};
+  adminEarnings.unshift(record);persistEarnings();t.status='completed';t.approvedAt=record.createdAt;t.approvedAmount=amount;
+ }else return res.status(400).json({error:'Invalid action'});
+ saveTasks();io.emit('earnings-updated');notifyTask(t,t.status);res.json({ok:true,task:t});
 });
-
+app.post('/api/admin/tasks/:id/reassign',requireRole('admin'),(req,res)=>{
+ const t=adminTasks.find(t=>t.id===req.params.id),wid=resolveWorkerId(req.body?.workerId);
+ if(!t||!['declined','pending_acceptance'].includes(t.status))return res.status(409).json({error:'Task cannot be reassigned'});
+ if(!wid||!users.some(u=>u.role==='worker'&&resolveWorkerId(u.id||u.username)===wid))return res.status(400).json({error:'Valid worker required'});
+ t.workerId=wid;t.assignedWorkerId='';t.status='pending_acceptance';saveTasks();notifyTask(t,'reassigned');res.json({ok:true,task:t});
+});
+app.post('/api/admin/tasks/:id/cancel',requireRole('admin'),(req,res)=>{
+ const t=adminTasks.find(t=>t.id===req.params.id);if(!t||!['open','pending_acceptance','declined'].includes(t.status))return res.status(409).json({error:'Cannot cancel task'});
+ t.status='cancelled';saveTasks();notifyTask(t,'cancelled');res.json({ok:true,task:t});
+});
+app.post('/api/admin/earnings/:id/paid',requireRole('admin'),(req,res)=>{
+ const e=adminEarnings.find(e=>e.id===req.params.id);if(!e)return res.status(404).json({error:'Earning not found'});
+ if(!e.paidAt){e.paidAt=new Date().toISOString();persistEarnings();io.emit('earnings-updated');}res.json({ok:true,record:e});
+});
 // Admin Manual Earnings & Bonus Endpoints
 app.get('/api/admin/earnings', requireRole('admin'), (req, res) => {
   res.json({ ok: true, earnings: adminEarnings });
@@ -1544,37 +1515,18 @@ io.on('connection', socket => {
     }
   );
 
-  socket.on('send-chat-message', ({ workerId, text } = {}) => {
-    const messageText = String(text || '').trim();
-    if (!messageText) return;
-
-    const targetWorkerId = user.role === 'worker' ? user.id : workerId;
-    if (!targetWorkerId) return;
-
-    const msg = {
-      id: crypto.randomUUID(),
-      workerId: targetWorkerId,
-      senderRole: user.role,
-      senderName: user.name || user.username,
-      text: messageText,
-      timestamp: Date.now()
-    };
-
-    chatMessages.push(msg);
-
-    io.to('admins').emit('chat-message', msg);
-    const workerState = states.get(targetWorkerId);
-    if (workerState && workerState.socketId) {
-      io.to(workerState.socketId).emit('chat-message', msg);
-    }
+  socket.on('send-chat-message',({workerId,text}={})=>{
+    const messageText=String(text||'').trim().slice(0,5000);if(!messageText)return;
+    const targetWorkerId=resolveWorkerId(user.role==='worker'?(user.username||user.id):workerId);
+    if(!targetWorkerId||!users.some(u=>u.role==='worker'&&resolveWorkerId(u.id||u.username)===targetWorkerId))return;
+    const msg={id:crypto.randomUUID(),workerId:targetWorkerId,senderRole:user.role,senderName:user.name||user.username,text:messageText,timestamp:Date.now()};
+    chatMessages.push(msg);persistChat();io.to('admins').emit('chat-message',msg);io.to('worker:'+targetWorkerId).emit('chat-message',msg);
   });
-
-  socket.on('get-chat-history', ({ workerId } = {}) => {
-    const targetWorkerId = user.role === 'worker' ? user.id : workerId;
-    const history = chatMessages.filter(m => m.workerId === targetWorkerId);
-    socket.emit('chat-history', { workerId: targetWorkerId, messages: history });
+  socket.on('get-chat-history',({workerId}={})=>{
+    const targetWorkerId=resolveWorkerId(user.role==='worker'?(user.username||user.id):workerId);
+    if(!targetWorkerId)return;
+    socket.emit('chat-history',{workerId:targetWorkerId,messages:chatMessages.filter(m=>resolveWorkerId(m.workerId)===targetWorkerId)});
   });
-
   socket.on('disconnect', () => {
     if (user.role === 'worker' && user.id) {
       const state = states.get(user.id);
