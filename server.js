@@ -178,6 +178,7 @@ for (const worker of users.filter(user => user.role === 'worker')) {
     }
   }
 
+  state.taskHoursResetAt = Math.max(0,Number(old?.taskHoursResetAt)||0);
   states.set(worker.id, state);
   if (worker.username && worker.username !== worker.id) {
     states.set(worker.username, state);
@@ -200,7 +201,8 @@ function persistState() {
       sessionId: state.sessionId,
       status: state.status,
       startedAt: state.startedAt,
-      accumulatedMs: state.accumulatedMs
+      accumulatedMs: state.accumulatedMs,
+      taskHoursResetAt: state.taskHoursResetAt || 0
     };
   }
 
@@ -221,6 +223,7 @@ function safeWorkerState(state) {
     status: state.status,
     startedAt: state.startedAt,
     accumulatedMs: state.accumulatedMs,
+      taskHoursResetAt: state.taskHoursResetAt || 0,
     lastSeenAt: state.lastSeenAt,
     liveMode: state.liveMode,
     liveRequestedAt: state.liveRequestedAt
@@ -627,6 +630,9 @@ function persistChat() {
 
 function saveTasks(){writeJsonAtomic(TASKS_FILE,adminTasks);io.emit('tasks-updated');}
 function taskWorker(req){return resolveWorkerId(req.session.user.username||req.session.user.id);}
+function activeTaskFor(wid,excludeId){return adminTasks.find(t=>t.id!==excludeId&&resolveWorkerId(t.assignedWorkerId)===wid&&['in_progress','revision_requested'].includes(t.status));}
+function taskHoursMs(wid){const state=states.get(wid);const since=Number(state?.taskHoursResetAt||0);const closed=workSessions.filter(x=>resolveWorkerId(x.workerId)===wid&&x.endedAt&&Number(x.endedAt)>since).reduce((sum,x)=>sum+Math.max(0,Number(x.durationMs)||0),0);const current=state&&state.sessionId?timerState.elapsed(state):0;return Math.round(closed+current);}
+
 function notifyTask(task,type){io.to('admins').emit('task-notification',{type,taskId:task.id,workerId:task.assignedWorkerId||task.workerId});if(task.assignedWorkerId||task.workerId)io.to('worker:'+(task.assignedWorkerId||task.workerId)).emit('task-notification',{type,taskId:task.id});}
 app.get('/api/worker/tasks',requireRole('worker'),(req,res)=>{
  const wid=taskWorker(req),tasks=adminTasks.filter(t=>(t.status==='open'&&!t.workerId&&!t.assignedWorkerId)||resolveWorkerId(t.assignedWorkerId)===wid||(t.status==='pending_acceptance'&&resolveWorkerId(t.workerId)===wid));
@@ -636,6 +642,7 @@ app.get('/api/worker/tasks',requireRole('worker'),(req,res)=>{
 app.post('/api/worker/tasks/:id/accept',requireRole('worker'),(req,res)=>{
  const wid=taskWorker(req),t=adminTasks.find(t=>t.id===req.params.id);
  if(!t)return res.status(404).json({error:'Task not found'});
+ if(activeTaskFor(wid,t.id))return res.status(409).json({error:'Submit your ongoing task before accepting another task'});
  if(!((t.status==='open'&&!t.workerId&&!t.assignedWorkerId)||(t.status==='pending_acceptance'&&resolveWorkerId(t.workerId)===wid)))return res.status(409).json({error:'Task already taken or unavailable'});
  t.assignedWorkerId=wid;t.status='in_progress';t.acceptedAt=new Date().toISOString();saveTasks();notifyTask(t,'accepted');res.json({ok:true,task:t});
 });
@@ -648,7 +655,7 @@ app.post('/api/worker/tasks/:id/submit',requireRole('worker'),(req,res)=>{
  const wid=taskWorker(req),t=adminTasks.find(t=>t.id===req.params.id);
  if(!t||resolveWorkerId(t.assignedWorkerId)!==wid)return res.status(403).json({error:'Not your task'});
  if(!['in_progress','revision_requested'].includes(t.status))return res.status(409).json({error:'Task not ready for submission'});
- t.submissionNotes=String(req.body?.notes||'').slice(0,4000);t.submittedAt=new Date().toISOString();t.status='submitted';saveTasks();notifyTask(t,'submitted');res.json({ok:true,task:t});
+ t.workDurationMs=taskHoursMs(wid);t.workHours=Number((t.workDurationMs/3600000).toFixed(2));t.submissionSummary=`Task: ${t.title} | Status: Done | Worker hours: ${t.workHours} hrs`;const timer=states.get(wid);if(timer){const now=Date.now();if(timer.sessionId){const record=workSessions.find(x=>x.id===timer.sessionId&&x.endedAt===null);if(record){record.endedAt=now;record.durationMs=timerState.elapsed(timer);record.reason='task_submitted';}timer.sessionId=null;}timer.status='STOPPED';timer.startedAt=null;timer.accumulatedMs=0;timer.taskHoursResetAt=now;persistState();writeJsonAtomic(SESSIONS_FILE,workSessions);broadcastStates();}t.submissionNotes=String(req.body?.notes||'').slice(0,4000);t.submittedAt=new Date().toISOString();t.status='submitted';saveTasks();notifyTask(t,'submitted');res.json({ok:true,task:t});
 });
 app.get('/api/worker/earnings',requireRole('worker'),(req,res)=>{
  const wid=taskWorker(req),records=adminEarnings.filter(e=>resolveWorkerId(e.workerId)===wid);
