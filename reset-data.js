@@ -6,7 +6,7 @@ const path = require('path');
 const dataDir = path.join(__dirname, 'data');
 const files = [
   'state.json', 'sessions.json', 'tasks.json', 'chat.json',
-  'earnings.json', 'users.json', 'device_requests.json'
+  'earnings.json', 'users.json'
 ];
 for (const name of files) {
   const target = path.join(dataDir, name);

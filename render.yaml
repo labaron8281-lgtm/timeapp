@@ -7,6 +7,8 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
+      - key: APP_BASE_URL
+        value: https://worker-timer-monitor-8gsa.onrender.com
       - key: NODE_ENV
         value: production
       - key: SESSION_SECRET
