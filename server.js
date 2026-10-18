@@ -420,9 +420,9 @@ function appLoginRateLimit(req, res, next) {
   next();
 }
 
-// Shared-password gate for the Apartments.com desktop app. Password exists only in Render env.
+// Shared-password gate for the Apartments.com desktop app. APT_PASSWORD exists only in Render environment.
 app.post('/api/app-login', appLoginRateLimit, (req, res) => {
-  const configuredPassword = process.env.APP_LOGIN_PASSWORD;
+  const configuredPassword = process.env.APT_PASSWORD;
   if (typeof configuredPassword !== 'string' || configuredPassword.length < 12) {
     return res.status(503).json({ ok: false, error: 'App login is not configured on the server.' });
   }
